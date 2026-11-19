@@ -16,8 +16,8 @@ _CONFIG_FILE = Path.home() / ".cycplusSync" / "config.toml"
 
 
 class Settings(BaseSettings):
-    target_name: str = Field(default="M1_B0ED", description="BLE device name to scan for")
-    target_mac_address: str = Field(default="", description="Optional MAC address; skips scan if set")
+    target_name: str | None = Field(default=None, description="BLE device name to scan for; if None, auto-detects any M1_XXXX device")
+    target_mac_address: str | None = Field(default=None, description="Optional MAC address; skips scan if set")
     profile: str = Field(default="Default", description="Profile name; rides stored under ~/.cycplusSync/profiles/<profile>/rides")
 
     model_config = SettingsConfigDict(
