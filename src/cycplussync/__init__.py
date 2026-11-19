@@ -7,19 +7,27 @@ import re
 
 from cycplussync.settings import Settings
 
-CHARACTERISTIC_UUID = "6e400004-b5a3-f393-e0a9-e50e24dcca9e"
-CHARACTERISTIC_UUIDTX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
-CHARACTERISTIC_UUIDRX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+# Nordic UART Service (NUS) characteristics used by the CycPlus M1
+CHARACTERISTIC_UUID = "6e400004-b5a3-f393-e0a9-e50e24dcca9e"   # status/ack notifications (device→host)
+CHARACTERISTIC_UUIDTX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # file data stream (device→host)
+CHARACTERISTIC_UUIDRX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # command channel (host→device)
 
+# Request payload for the device file listing (\x05 + "filelist.txt" + \x57)
 VALUE_TO_WRITE = bytearray([0x05, 0x66, 0x69, 0x6c, 0x65, 0x6c, 0x69, 0x73, 0x74, 0x2e, 0x74, 0x78, 0x74, 0x57])
+# Disk-space query command
 VALUE_TO_WRITE_DISKSPACE = bytearray([0x09, 0x00, 0x09])
+# Read-permission request; device must acknowledge before a file transfer can start
 VALUE_TO_WRITE_READ = bytearray([0xff, 0x00, 0xff])
+# Initiates a data block copy (ASCII 'C')
 VALUE_TO_WRITE_COPY = bytearray([0x43])
+# Acknowledges receipt of one data block (ASCII ACK / 0x06)
 VALUE_TO_WRITE_COPYOK = bytearray([0x06])
+# Signals end-of-transfer to the device (ASCII NAK / 0x15)
 VALUE_TO_WRITE_COPYOKOK = bytearray([0x15])
-AWAIT_NEW_DATA = bytearray([0x41, 0x77, 0x61, 0x69, 0x74, 0x4E, 0x65, 0x77, 0x44, 0x61, 0x74, 0x61])
+# Sentinel placed in notification_data while waiting for the device to respond
+AWAIT_NEW_DATA = bytearray([0x41, 0x77, 0x61, 0x69, 0x74, 0x4E, 0x65, 0x77, 0x44, 0x61, 0x74, 0x61])  # b"AwaitNewData"
 
-MAC_CACHE_FILE = ".cycplus_m1_mac"  # filename for caching the discovered device MAC
+MAC_CACHE_FILE = ".cycplus_m1_mac"  # cached MAC address file, stored in the profile directory
 MAC_RE = re.compile(r"^[0-9A-F]{2}(?::[0-9A-F]{2}){5}$", re.IGNORECASE)
 
 # Configure logging
