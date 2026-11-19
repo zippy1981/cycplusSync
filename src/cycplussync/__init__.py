@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from pathlib import Path
 from bleak import BleakScanner, BleakClient
 import re
@@ -18,9 +19,80 @@ VALUE_TO_WRITE_COPYOK = bytearray([0x06])
 VALUE_TO_WRITE_COPYOKOK = bytearray([0x15])
 AWAIT_NEW_DATA = bytearray([0x41, 0x77, 0x61, 0x69, 0x74, 0x4E, 0x65, 0x77, 0x44, 0x61, 0x74, 0x61])
 
+MAC_CACHE_FILE = ".cycplus_m1_mac"  # filename for caching the discovered device MAC
+MAC_RE = re.compile(r"^[0-9A-F]{2}(?::[0-9A-F]{2}){5}$", re.IGNORECASE)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def derive_m1_name_from_mac(mac_address: str) -> str | None:
+    """Derive the M1 BLE advertisement name from its MAC address (AA:BB:... -> M1_BBAA)."""
+    if not mac_address:
+        return None
+    parts = mac_address.strip().split(":")
+    if len(parts) < 2:
+        return None
+    first, second = parts[0].upper(), parts[1].upper()
+    if len(first) != 2 or len(second) != 2:
+        return None
+    return f"M1_{second}{first}"
+
+
+def normalize_mac(mac_address: str | None) -> str | None:
+    """Normalize a MAC address to uppercase colon-separated format; returns None if invalid."""
+    if not mac_address:
+        return None
+    value = mac_address.strip().upper()
+    return value if MAC_RE.match(value) else None
+
+
+def read_cached_mac(cache_path: Path) -> str | None:
+    """Read a previously cached MAC address from disk."""
+    try:
+        cached = normalize_mac(cache_path.read_text(encoding="utf-8"))
+        return cached
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to read MAC cache {cache_path}: {e}")
+        return None
+
+
+def write_cached_mac(cache_path: Path, mac_address: str) -> None:
+    """Persist a discovered MAC address to disk for faster reconnection."""
+    mac = normalize_mac(mac_address)
+    if not mac:
+        return
+    try:
+        cache_path.write_text(mac, encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to write MAC cache {cache_path}: {e}")
+
+
+def m1_name_to_mac_prefix(name: str | None) -> str | None:
+    """Extract the two-byte MAC prefix encoded in an M1 device name (M1_3FCC -> CC:3F)."""
+    if not name:
+        return None
+    match = re.fullmatch(r"M1_([0-9A-Fa-f]{4})", name.strip())
+    if not match:
+        return None
+    suffix = match.group(1).upper()
+    return f"{suffix[2:4]}:{suffix[0:2]}"
+
+
+def select_best_m1_candidate(candidates: list) -> dict | None:
+    """Choose the best candidate M1 device, preferring strongest RSSI signal."""
+    if not candidates:
+        return None
+
+    def sort_key(item):
+        rssi = item.get("rssi")
+        has_rssi = isinstance(rssi, (int, float))
+        return (0 if has_rssi else 1, -(rssi if has_rssi else -9999), item["index"])
+
+    return sorted(candidates, key=sort_key)[0]
 
 
 class BluetoothFileTransfer:
@@ -30,6 +102,7 @@ class BluetoothFileTransfer:
             Path.home() / ".cycplusSync" / "profiles" / self.settings.profile / "rides"
         )
         self.download_directory.mkdir(parents=True, exist_ok=True)
+        self.mac_cache_path = self.download_directory.parent / MAC_CACHE_FILE
 
         self.combine = False
         self.reply_ok = False
@@ -119,28 +192,73 @@ class BluetoothFileTransfer:
 
         return notification_handler
 
-    async def discover_device(self, target_name, target_mac=None):
-        """Discover device by name or MAC address"""
+    async def discover_device(self, target_name: str | None, target_mac: str | None = None) -> object | None:
+        """Discover device by name, MAC address, or auto-detect any M1_XXXX device."""
+        target_mac = normalize_mac(target_mac)
+
+        if not target_mac:
+            cached = read_cached_mac(self.mac_cache_path)
+            if cached:
+                target_mac = cached
+                logger.info(f"Using cached MAC address: {target_mac}")
+
+        if not target_name and target_mac:
+            target_name = derive_m1_name_from_mac(target_mac)
+            if target_name:
+                logger.info(f"Auto-derived device name from MAC {target_mac}: {target_name}")
+
         if target_mac:
             logger.info(f"Attempting to connect directly to MAC address: {target_mac}")
 
-            # Create a mock device object for direct MAC connection
             class MockDevice:
-                def __init__(self, address):
+                def __init__(self, address, name):
                     self.address = address
-                    self.name = f"Device_{address}"
+                    self.name = name
 
-            return MockDevice(target_mac)
+            return MockDevice(target_mac, target_name or f"Device_{target_mac}")
 
         logger.info("Scanning for Bluetooth devices...")
         devices = await BleakScanner.discover()
-        for device in devices:
+
+        expected_prefix = m1_name_to_mac_prefix(target_name)
+        m1_pattern = re.compile(r"^M1_[0-9A-F]{4}$", re.IGNORECASE)
+        candidates = []
+        for idx, device in enumerate(devices):
             logger.info(f"Found device: {device.name} - {device.address}")
-            if device.name == target_name:
+            device_name = device.name or ""
+            device_mac = normalize_mac(device.address)
+            if not device_mac:
+                continue
+            name_match = bool(m1_pattern.match(device_name))
+            prefix_match = bool(expected_prefix and device_mac.startswith(expected_prefix))
+            if not name_match and not prefix_match:
+                continue
+            candidates.append({
+                "index": idx,
+                "device": device,
+                "name": device_name,
+                "mac": device_mac,
+                "rssi": getattr(device, "rssi", None),
+            })
+
+        if not target_name:
+            logger.info("No TARGET_NAME set — auto-selecting best M1_XXXX device...")
+            chosen = select_best_m1_candidate(candidates)
+            if chosen:
+                write_cached_mac(self.mac_cache_path, chosen["mac"])
+                logger.info(f"Auto-selected device: {chosen['name']} - {chosen['mac']}")
+                return chosen["device"]
+            logger.warning("No M1_XXXX device found during scan.")
+            return None
+
+        for candidate in candidates:
+            device = candidate["device"]
+            if device.name == target_name or (expected_prefix and candidate["mac"].startswith(expected_prefix)):
+                write_cached_mac(self.mac_cache_path, candidate["mac"])
                 logger.info(f"Found target device: {device.name} - {device.address}")
                 return device
 
-        logger.warning(f"Device with name {target_name} not found.")
+        logger.warning(f"Device '{target_name}' not found.")
         return None
 
     async def start_notify(self, client, uuid):
@@ -356,14 +474,16 @@ class BluetoothFileTransfer:
 
         device = await self.discover_device(
             self.settings.target_name,
-            self.settings.target_mac_address if self.settings.target_mac_address else None,
+            self.settings.target_mac_address,
         )
         if not device:
             if self.settings.target_mac_address:
                 logger.error(f"Unable to create device object for MAC address: {self.settings.target_mac_address}")
             else:
                 logger.error(
-                    "Device discovery failed. Consider setting target_mac_address if you know the device's MAC address.")
+                    "Device discovery failed. No M1_XXXX device found. "
+                    "Set target_name or target_mac_address in config or env to target a specific device."
+                )
             return
 
         # Use retry logic for connection
